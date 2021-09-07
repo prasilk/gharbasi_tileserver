@@ -1,0 +1,135 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/trusty64"
+  config.vm.hostname = "osmtileserver"
+
+  config.vm.network "forwarded_port", guest: 80, host: 8080
+  # config.vm.network "private_network", ip: "192.168.33.10"
+  config.vm.post_up_message = "osmtileserver is running at http://localhost:8080"
+
+  config.vm.synced_folder "../data", "/data_share"
+
+  config.vm.provider "virtualbox" do |m|
+    m.gui = false
+    m.name = "osmtileserver"
+    m.cpus = 2
+    m.memory = 4096
+  end
+
+  config.vm.provision "shell", inline: <<-SHELL
+    apt-get update
+
+    # Base packages
+    apt-get install -y make cmake g++ libboost-all-dev libexpat1-dev zlib1g-dev subversion git-core tar unzip wget bzip2 build-essential autoconf libtool libxml2-dev libgeos-dev libgeos++-dev libpq-dev libbz2-dev libproj-dev munin-node munin libprotobuf-c0-dev protobuf-c-compiler libfreetype6-dev libpng12-dev libtiff4-dev libicu-dev libgdal1-dev libcairo-dev libcairomm-1.0-dev apache2 apache2-dev libagg-dev liblua5.2-dev ttf-unifont lua5.2 liblua5.2-dev libgeotiff-epsg node-carto postgresql postgresql-contrib postgis postgresql-9.3-postgis-2.1 osmosis
+
+    # Setting up PostgreSQL
+    sudo -u postgres createuser -S osmuser
+    sudo -u postgres createdb -E UTF8 -O osmuser gis
+    useradd -m osmuser
+    sudo -u postgres psql --command="CREATE EXTENSION postgis;ALTER TABLE geometry_columns OWNER TO osmuser;ALTER TABLE spatial_ref_sys OWNER TO osmuser;" --dbname=gis
+
+    # Installing osm2pgsql
+    mkdir ~/src
+    git clone git://github.com/openstreetmap/osm2pgsql.git ~/src/osm2pgsql
+    cd ~/src/osm2pgsql
+    mkdir build && cd build
+    cmake ..
+    make
+    make install
+
+    # Installing Mapnik
+    git clone git://github.com/mapnik/mapnik ~/src/mapnik
+    cd ~/src/mapnik
+    git branch 2.2 origin/2.2.x
+    git checkout 2.2
+    python scons/scons.py configure INPUT_PLUGINS=all OPTIMIZATION=3  DEBUG=0 SYSTEM_FONTS=/usr/share/fonts/truetype/
+    make -jN
+    make install
+    ldconfig
+
+    # Installing mod_tile and renderd
+    git clone git://github.com/openstreetmap/mod_tile.git ~/src/mod_tile
+    cd ~/src/mod_tile
+    ./autogen.sh
+    ./configure
+    make -jN
+    make install
+    make install-mod_tile
+    ldconfig
+
+    # Installing osm-bright stylesheet
+    mkdir -p /usr/local/share/maps/style
+    chown osmuser /usr/local/share/maps/style
+    cd /usr/local/share/maps/style
+    wget -q https://github.com/OpenGeoscience/osm-bright/archive/master.zip
+    wget -q http://data.openstreetmapdata.com/simplified-land-polygons-complete-3857.zip
+    wget -q http://data.openstreetmapdata.com/land-polygons-split-3857.zip
+    mkdir ne_10m_populated_places_simple && cd ne_10m_populated_places_simple
+    wget -q http://www.naturalearthdata.com/http//www.naturalearthdata.com/download/10m/cultural/ne_10m_populated_places_simple.zip
+    unzip ne_10m_populated_places_simple.zip && rm ne_10m_populated_places_simple.zip
+    cd ..
+    unzip '*.zip'
+    mkdir osm-bright-master/shp
+    mv land-polygons-split-3857 osm-bright-master/shp/
+    mv simplified-land-polygons-complete-3857 osm-bright-master/shp/
+    mv ne_10m_populated_places_simple osm-bright-master/shp/
+    cd osm-bright-master/shp/land-polygons-split-3857
+    cd osm-bright-master/shp/land-polygons-split-3857
+    shapeindex land_polygons.shp
+    cd ../simplified-land-polygons-complete-3857/
+    shapeindex simplified_land_polygons.shp
+    cd ../..
+    cp /data_share/config/osm-bright/osm-bright.osm2pgsql.mml osm-bright/
+    cp /data_share/config/osm-bright/labels.mss osm-bright/
+    cp /data_share/config/osm-bright/configure.py .
+    rm configure.py.sample
+    ./make.py
+    cd ../OSMBright/
+    carto project.mml > OSMBright.xml
+
+    # Configure renderd & mod_tile
+    cp /data_share/config/renderd/renderd.conf /usr/local/etc/
+    echo "LoadModule tile_module /usr/lib/apache2/modules/mod_tile.so" >> /etc/apache2/conf-available/mod_tile.conf
+    echo "LoadModule headers_module /usr/lib/apache2/modules/mod_headers.so" >> /etc/apache2/conf-available/mod_tile.conf
+    cp /data_share/config/apache2/000-default.conf /etc/apache2/sites-available/
+    a2enconf mod_tile
+    cp /data_share/config/renderd/renderd.init /etc/init.d/renderd
+    chmod u+x /etc/init.d/renderd
+    ln -s /etc/init.d/renderd /etc/rc2.d/S20renderd
+    mkdir /var/lib/mod_tile
+    chown osmuser /var/lib/mod_tile
+
+    # System tuning
+    cp /data_share/config/postgres/postgresql.conf /etc/postgresql/9.3/main/
+    cp /data_share/config/sysctl.conf /etc/
+
+    # Import latest OSM-data for California
+    mkdir /usr/local/share/maps/California
+    chown osmuser /usr/local/share/maps/California
+    cd /usr/local/share/maps/California
+    wget -q http://download.geofabrik.de/north-america/us/california-latest.osm.pbf
+    sudo -u osmuser osm2pgsql --slim -d gis -C 2048 --number-processes 3 /usr/local/share/maps/California/california-latest.osm.pbf
+
+    # Setup auto-updating for OSM-data
+    /root/src/osm2pgsql/install-postgis-osm-user.sh gis osmuser
+    cp /root/src/mod_tile/openstreetmap-tiles-update-expire /usr/bin/
+    cp /root/src/mod_tile/osmosis-db_replag /usr/bin/
+    mkdir /var/log/tiles && chown osmuser /var/log/tiles
+    DATE=`date +%Y-%m-%d` &&  sudo -u osmuser openstreetmap-tiles-update-expire $DATE
+    cp /data_share/config/osmosis/configuration.txt /var/lib/mod_tile/.osmosis/
+    sudo -u osmuser openstreetmap-tiles-update-expire
+    cp /data_share/config/osmosis/rc.local /etc/rc.local
+
+    # Starting services
+    mkdir /var/run/renderd
+    chown osmuser /var/run/renderd
+    /etc/init.d/renderd start
+    service apache2 restart
+
+    # Setup default map interface (TODO: replace with osmuser)
+    rm /var/www/html/index.html
+    cp /data_share/web/index.html /var/www/html/
+  SHELL
+end
